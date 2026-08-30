@@ -1,9 +1,9 @@
 #include "esp_log.h"
 #include "esp_h264_enc_single_hw.h"
 #include "esp_h264_alloc.h"
-#include "esp_timer.h"
+#include "esp_log_level.h"
 #include "freertos/idf_additions.h"
-#include "multicast.h"
+#include "lvb.h"
 #include "stream.h"
 #include "mpeg_ts.h"
 #include "esp_event.h"
@@ -12,10 +12,52 @@
 #include <sys/param.h>
 #include <sys/time.h>
 
+#define PRO_CPU 0
+#define APP_CPU 1
+
 static const char *TAG = "lvc::main.c";
 
-static esp_netif_t *netif;
 static int stream_fd;
+
+static uint8_t *swap_buffer;
+static uint32_t swap_data_length;
+
+static TaskHandle_t xTxTask = NULL, xEncTask = NULL;
+
+void transmit_task(void *pvParameter) {
+    xTaskNotifyGiveIndexed(xEncTask, 0);
+
+    transport_stream_t ts;
+    esp_err_t err = create_ts(&ts);
+
+    while (err < ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize transport stream");
+        close_ts(ts);
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+        err = create_ts(&ts);
+    }
+
+    int frame_count = 0;
+
+    for (;;) {
+        ulTaskNotifyTakeIndexed(0, pdTRUE, portMAX_DELAY);
+        // Somehow we need to move all of this MPEG-TS logic on to the protocol core
+        // That way we can split up the FEC encoding and IO writing packet-wise to lessen the surge load on LVB
+
+        // Send PAT and PMT every 3 frames
+        if (frame_count++ % 3 == 0) {
+            send_pat(&ts);
+            send_pmt(&ts);
+        }
+
+        ESP_LOGI(TAG, "Sending PES packets for frame of size %d", swap_data_length);
+        if (send_pes_packets(&ts, swap_buffer, swap_data_length) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to send PES packets for frame of size %d", swap_data_length);
+        }
+
+        xTaskNotifyGiveIndexed(xEncTask, 0);
+    }
+}
 
 void encode_task(void *pvParameter) {
     esp_h264_enc_cfg_hw_t cfg = {0};
@@ -43,25 +85,18 @@ void encode_task(void *pvParameter) {
     in_frame.raw_data.buffer = esp_h264_aligned_calloc(16, 1, in_frame.raw_data.len, &in_frame.raw_data.len, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
                                                 
     esp_h264_enc_out_frame_t out_frame = {.raw_data.len = in_frame.raw_data.len};
-    out_frame.raw_data.buffer = esp_h264_aligned_calloc(16, 1, in_frame.raw_data.len, &in_frame.raw_data.len, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+    out_frame.raw_data.buffer = esp_h264_aligned_calloc(16, 1, out_frame.raw_data.len, &out_frame.raw_data.len, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+
+    // Allocate the swap buffer in the same way to allow it to be used in place of `out_frame.raw_data.buffer`
+    swap_buffer = esp_h264_aligned_calloc(16, 1, out_frame.raw_data.len, &out_frame.raw_data.len, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+    swap_data_length = 0;
 
     // Start encoding
     esp_h264_enc_open(enc);
 
-    int frame_count = 0;
-
     // Encoding loop
-    while (1) {
+    for (;;) {
         int err = 0;
-
-        transport_stream_t ts;
-        err = create_ts(&ts, netif);
-
-        while (err < ESP_OK) {
-            ESP_LOGE(TAG, "Failed to create IPv4 multicast socket");
-            vTaskDelay(5 / portTICK_PERIOD_MS);
-            err = create_ts(&ts, netif);
-        }
         
         while (err >= 0) {
             while (err >= 0) {
@@ -74,40 +109,25 @@ void encode_task(void *pvParameter) {
                     break;
                 }
 
-                frame_count++;
-
-                // if (!set_frame_rate && esp_timer_get_time() - start_time_us >= (4 * 1000 * 1000)) {
-                //     esp_h264_enc_param_hw_handle_t fps_hd;
-                //     esp_h264_enc_hw_get_param_hd(enc, &fps_hd);
-                //     esp_h264_enc_set_fps(&fps_hd->base, frame_count / 4);
-                // }
-
                 if (esp_h264_enc_process(enc, &in_frame, &out_frame) != ESP_H264_ERR_OK) {
                     ESP_LOGE(TAG, "error while encoding frame");
                     continue;
                 }
 
                 ESP_LOGI(TAG, "Sending packet of %d bytes", out_frame.length);
+                ulTaskNotifyTakeIndexed(0, pdTRUE, portMAX_DELAY);
+                
+                // Swap buffers
+                uint8_t *tmp_buf = swap_buffer;
+                swap_buffer = out_frame.raw_data.buffer;
+                out_frame.raw_data.buffer = tmp_buf;
+                swap_data_length = out_frame.length;
 
-                if (frame_count % 3 == 0) {
-                    send_pat(&ts);
-                    send_pmt(&ts);
-                }
-
-                send_pes_packets(&ts, out_frame.raw_data.buffer, out_frame.length);
-                // send _multicast_packet(ts.multicast_socket, out_frame.raw_data.buffer, out_frame.length);
+                xTaskNotifyGiveIndexed(xTxTask, 0);
             }
-
-            //ESP_LOGI(TAG, "Reloading encoder!");
-            //esp_h264_enc_close(enc);
-            //esp_h264_enc_del(enc);
-            //int err = esp_h264_enc_hw_new(&cfg, &enc);
-            //esp_h264_enc_open(enc);
         }
         
         ESP_LOGE(TAG, "Error sending multicast packet, closing socket and restarting");
-        close_ts(ts);
-        // stream_release_frame(stream_fd, &video_buffer)
     }
 
     // Resource release
@@ -118,7 +138,6 @@ void encode_task(void *pvParameter) {
 
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_err_t ret = stream_init();
@@ -133,9 +152,6 @@ void app_main(void) {
         return;
     }
 
-    if (eth_connect(&netif) != ESP_OK) {
-        ESP_LOGE(TAG, "failed to initialize ethernet handle");
-    }
-
-    xTaskCreate(&encode_task, "encode_task", 4096, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(&encode_task, "encode_task", 4096, NULL, 5, &xEncTask, APP_CPU);
+    xTaskCreatePinnedToCore(&transmit_task, "transmit_task", 4096, NULL, 5, &xTxTask, PRO_CPU);
 }

@@ -1,6 +1,6 @@
 #include "mpeg_ts.h"
+#include "lvb.h"
 #include "esp_err.h"
-#include "multicast.h"
 #include <stdint.h>
 #include <sys/_timeval.h>
 #include <sys/time.h>
@@ -26,25 +26,17 @@ uint64_t get_pts(bool dts);
 unsigned int write_pes_header(uint8_t *packet, int type, uint8_t *pes_cc);
 esp_err_t send_ts_table(transport_stream_t *ts, uint8_t *table_data, uint8_t data_len, uint8_t *cc, uint16_t pid, uint16_t ident, uint8_t table_id);
 
-esp_err_t create_ts(transport_stream_t *ts, esp_netif_t *netif) {
+esp_err_t create_ts(transport_stream_t *ts) {
     ts->pes_cc = 0;
     ts->pat_cc = 0;
     ts->pmt_cc = 0;
 
-    int sock = create_multicast_socket(netif);
-    if (sock < 0) {
-        return ESP_FAIL;
-    }
-
-    ts->multicast_socket = sock;
-    ts->datagram = malloc(TS_UDP_DATAGRAM);
-    ts->datagram_offset = 0;
-
+    ESP_ERROR_CHECK(init_phy(&ts->tx_unit));
     return esp_async_crc_install_gdma_ahb(&crc_config, &ts->crc_hdl);
 }
 
-inline void close_ts(transport_stream_t ts) {
-    close_socket(ts.multicast_socket);
+esp_err_t close_ts(transport_stream_t ts) {
+    return close_phy(ts.tx_unit);
 }
 
 esp_err_t send_pes_packets(transport_stream_t *ts, const void *dataptr, size_t len) {
@@ -64,22 +56,8 @@ esp_err_t send_pes_packets(transport_stream_t *ts, const void *dataptr, size_t l
             packet[header_len + i] = data[i];
         }
 
-        for (int i = 0; i < TS_PACKET_LENGTH; i++) {
-            ts->datagram[ts->datagram_offset + i] = packet[i];
-        }
-        
-        ts->datagram_offset += TS_PACKET_LENGTH;
-        if (ts->datagram_offset == TS_UDP_DATAGRAM) {    
-            // Send TS packet to the multicast socket.
-            int current_err = send_multicast_packet(ts->multicast_socket, (const void *) ts->datagram, TS_UDP_DATAGRAM);
-            // It's better to try to send the rest of the packets on error,
-            // as MPEG-TS is designed for unreliable connections.
-            if (current_err != ESP_OK) {
-                err = current_err;
-            }
-
-            ts->datagram_offset = 0;
-        }
+        // Who needs error checking??
+        transmit_packet(ts->tx_unit, &packet);
 
         if (breaking) {
             return err;
@@ -101,6 +79,8 @@ esp_err_t send_pes_packets(transport_stream_t *ts, const void *dataptr, size_t l
             payload_len = TS_PACKET_LENGTH - header_len;
         }
     }
+
+    return wait_for_tx(ts->tx_unit);
 }
 
 unsigned int write_pes_header(uint8_t *packet, int type, uint8_t *pes_cc) {
@@ -292,7 +272,7 @@ esp_err_t send_ts_table(transport_stream_t *ts, uint8_t *table_data, uint8_t dat
         (uint32_t *)(&buffer + TS_TABLE_HEADER_LEN + data_len)
     ));
 
-    return send_multicast_packet(ts->multicast_socket, &buffer, TS_PACKET_LENGTH);
+    return transmit_packet(ts->tx_unit, &buffer);
 }
 
 uint64_t get_pts(bool dts) {
