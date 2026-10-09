@@ -1,7 +1,6 @@
 #include "esp_log.h"
 #include "esp_h264_enc_single_hw.h"
 #include "esp_h264_alloc.h"
-#include "esp_timer.h"
 #include "freertos/idf_additions.h"
 #include "multicast.h"
 #include "stream.h"
@@ -11,11 +10,15 @@
 #include <sys/_timeval.h>
 #include <sys/param.h>
 #include <sys/time.h>
+#include "driver/gpio.h"
 
 static const char *TAG = "lvc::main.c";
 
 static esp_netif_t *netif;
 static int stream_fd;
+
+#define RADIO_LS_CTL 54
+#define RADIO_LS_CTL_MASK (1ULL<<RADIO_LS_CTL)
 
 void encode_task(void *pvParameter) {
     esp_h264_enc_cfg_hw_t cfg = {0};
@@ -116,6 +119,24 @@ void encode_task(void *pvParameter) {
     esp_h264_free(in_frame.raw_data.buffer);
 }
 
+void init_radio(void) {
+    gpio_config_t io_conf = {};
+    //disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = RADIO_LS_CTL_MASK;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+
+    
+    gpio_set_level(54, 1);
+    ESP_LOGI(TAG, "GPIO 54 configured and set");
+}
+
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
@@ -135,7 +156,7 @@ void app_main(void) {
 
     if (eth_connect(&netif) != ESP_OK) {
         ESP_LOGE(TAG, "failed to initialize ethernet handle");
-    }
+    } 
 
     xTaskCreate(&encode_task, "encode_task", 4096, NULL, 5, NULL);
 }
